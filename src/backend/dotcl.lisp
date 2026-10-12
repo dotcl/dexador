@@ -116,8 +116,10 @@ for the common shapes.  Multipart is not yet supported by this backend."
          (error "The dotcl backend does not support multipart content yet.")))))
 
 (defun octets->netbytes (octets)
-  "Marshal a CL octet vector to a fresh .NET byte[]."
-  (apply #'dotnet:new-array "System.Byte" (coerce octets 'list)))
+  "OCTETS as a value dotcl passes to .NET as a byte[]: a
+(simple-array (unsigned-byte 8) (*)) is marshalled to byte[] as it is, so
+only another kind of vector is copied. No per-byte argument list is built."
+  (coerce octets '(simple-array (unsigned-byte 8) (*))))
 
 ;;; ------------------------------------------------------------------
 ;;; Header wiring
