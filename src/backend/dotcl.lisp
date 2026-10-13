@@ -17,7 +17,11 @@
   (:use #:cl
         #:dexador.util)
   (:import-from #:dexador.body
-                #:decode-body)
+                #:decode-body
+                #:write-multipart-content)
+  (:import-from #:fast-io
+                #:fast-output-stream
+                #:finish-output-stream)
   (:import-from #:dexador.error
                 #:http-request-failed)
   (:import-from #:cl-cookie
@@ -94,9 +98,7 @@ both the message headers and the content headers of RESPONSE."
 ;;; Request content
 
 (defun convert-content (content multipart-p form-urlencoded-p preferred-content-type)
-  "Return (values octets content-type) for CONTENT, mirroring the other backends
-for the common shapes.  Multipart is not yet supported by this backend."
-  (declare (ignore multipart-p))
+  "Return (values octets content-type) for CONTENT, as the winhttp backend does."
   (etypecase content
     (null
      (values nil preferred-content-type))
@@ -110,10 +112,19 @@ for the common shapes.  Multipart is not yet supported by this backend."
      (values (alexandria:read-file-into-byte-vector content)
              (or preferred-content-type (mimes:mime content))))
     (cons
-     (if form-urlencoded-p
-         (values (babel:string-to-octets (quri:url-encode-params content))
-                 "application/x-www-form-urlencoded")
-         (error "The dotcl backend does not support multipart content yet.")))))
+     (cond (multipart-p
+            (let ((boundary (make-random-string 12))
+                  (stream (make-instance 'fast-output-stream)))
+              (write-multipart-content content boundary stream)
+              (values (finish-output-stream stream)
+                      (format nil "~A; boundary=~A"
+                              (or preferred-content-type "multipart/form-data")
+                              boundary))))
+           (form-urlencoded-p
+            (values (babel:string-to-octets (quri:url-encode-params content))
+                    "application/x-www-form-urlencoded"))
+           (t
+            (error "Can't convert a CONS content"))))))
 
 (defun octets->netbytes (octets)
   "OCTETS as a value dotcl passes to .NET as a byte[]: a
@@ -229,16 +240,27 @@ CLEAR-CONNECTION-POOL below."
          (content-type-cell (find :content-type headers
                                   :key #'car :test #'string-equal))
          (preferred-content-type (cdr content-type-cell))
+         (multipart-p (or (and preferred-content-type
+                               (>= (length preferred-content-type) 10)
+                               (string-equal "multipart/" preferred-content-type :end2 10))
+                          (and (null preferred-content-type)
+                               (consp content)
+                               (find-if #'pathnamep content :key #'cdr))))
          (form-urlencoded-p (and (consp content)
+                                 (not multipart-p)
                                  (or (null preferred-content-type)
                                      (string-equal preferred-content-type
                                                    "application/x-www-form-urlencoded"))))
          (user-agent (cdr (find :user-agent headers
                                 :key #'car :test #'string-equal))))
     (multiple-value-bind (body-octets detected-content-type)
-        (convert-content content nil form-urlencoded-p preferred-content-type)
-      (when (and detected-content-type (null content-type-cell))
-        (setf headers (append headers `(("Content-Type" . ,detected-content-type)))))
+        (convert-content content multipart-p form-urlencoded-p preferred-content-type)
+      (when detected-content-type
+        (cond ((null content-type-cell)
+               (setf headers (append headers `(("Content-Type" . ,detected-content-type)))))
+              (multipart-p
+               (setf headers (substitute (cons (car content-type-cell) detected-content-type)
+                                         content-type-cell headers)))))
 
       ;; Cookie jar -> Cookie header
       (when cookie-jar

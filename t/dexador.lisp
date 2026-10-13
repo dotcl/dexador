@@ -52,9 +52,9 @@
         (ok (equal body "/foo"))))))
 
 (deftest proxy-http-tests
-  #+windows
+  #+(or windows dotcl)
   (skip "Skipped proxy tests on Windows")
-  #-windows
+  #-(or windows dotcl)
   (testing-app ("proxy (http) case")
       ; proxy behavior is same as direct connection if http
       (lambda (env)
@@ -89,9 +89,9 @@
         (ok (equal body (format nil "lisp.org~%/foo")))))))
 
 (deftest proxy-socks5-tests
-  #+windows
+  #+(or windows dotcl)
   (skip "SOCKS5 proxy tests are skipped")
-  #-windows
+  #-(or windows dotcl)
   (testing-app ("proxy (socks5) case")
       (flet ((check (uri in out)
                (flexi-streams:with-input-from-sequence (in in)
@@ -205,9 +205,9 @@
         (ok (equal (quri:uri-path uri) "/200"))))))
 
 (deftest cross-host-redirect-credential-stripping-tests
-  #+windows
+  #+(or windows dotcl)
   (skip "Cross-host redirect credential tests use usocket backend only")
-  #-windows
+  #-(or windows dotcl)
   ;; Outer server: target that echoes back the Authorization header (or empty string)
   (testing-app ("cross-host redirect target")
       (lambda (env)
@@ -242,9 +242,9 @@
               (ok (equal body "") "Authorization header must not reach the target"))))))))
 
 (deftest same-host-redirect-credential-preservation-tests
-  #+windows
+  #+(or windows dotcl)
   (skip "Same-host redirect credential preservation tests use usocket backend only")
-  #-windows
+  #-(or windows dotcl)
   ;; Single server: /redirect-post returns 301 to /echo-auth; /echo-auth echoes Authorization header
   (testing-app ("same-host redirect credential preservation")
       (lambda (env)
@@ -263,9 +263,9 @@
           (ok (not (equal body "")) "Authorization header must be preserved on same-host redirect"))))))
 
 (deftest content-disposition-tests
-  #+windows
+  #+(or windows dotcl)
   (skip "Content-Disposition tests are skipped")
-  #-windows
+  #-(or windows dotcl)
   (testing "content-disposition"
     (ok (equal (dexador.backend.usocket::content-disposition "upload" #P"data/plain-file.txt")
                (format nil "Content-Disposition: form-data; name=\"upload\"; filename=\"plain-file.txt\"~C~C"
@@ -443,9 +443,9 @@
         '(200 (:content-type "text/plain") ("hi")))
     ;; decoding stream
     (let ((body (dex:get (localhost) :want-stream t :keep-alive nil)))
-      #+windows
+      #+(or windows dotcl)
       (ok (typep body 'stream))
-      #-windows
+      #-(or windows dotcl)
       (ok (typep body 'dexador.decoding-stream:decoding-stream)
           "body is a decoding stream")
       (ok (subtypep (stream-element-type body) 'babel:unicode-char)
@@ -472,9 +472,9 @@
               ("[{\"name\":\"allow-statement-in-has-a\",\"commit\":{\"sha\":\"d58b3c96503786c64eb2dba22980ebb14010bdbf\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/d58b3c96503786c64eb2dba22980ebb14010bdbf\"}},{\"name\":\"fix-has-a\",\"commit\":{\"sha\":\"4bcea61e84402317ab49605918972983a1511e6a\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/4bcea61e84402317ab49605918972983a1511e6a\"}},{\"name\":\"jojo\",\"commit\":{\"sha\":\"d2b753e7fdd0dbeada9721380cf410186a85535b\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/d2b753e7fdd0dbeada9721380cf410186a85535b\"}},{\"name\":\"master\",\"commit\":{\"sha\":\"d2b753e7fdd0dbeada9721380cf410186a85535b\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/d2b753e7fdd0dbeada9721380cf410186a85535b\"}}]")))
     ;; decoding stream
     (let ((body (dex:get (localhost) :want-stream t)))
-      #+windows
+      #+(or windows dotcl)
       (ok (typep body 'stream))
-      #-windows
+      #-(or windows dotcl)
       (ok (typep body 'dexador.decoding-stream:decoding-stream)
           "body is a decoding stream")
       (ok (subtypep (stream-element-type body) 'babel:unicode-char)
@@ -546,12 +546,12 @@
     (multiple-value-bind (b status response-headers uri opaque-socket-stream)
         (dex:get (localhost) :keep-alive t :use-connection-pool nil)
       (declare (ignorable b status response-headers uri opaque-socket-stream))
-      #+windows
+      #+(or windows dotcl)
       (ok (null opaque-socket-stream) "no socket stream")
-      #-windows
+      #-(or windows dotcl)
       (ok (open-stream-p opaque-socket-stream) "stream is kept alive")
       (ok (= status 200) "success")
-      #-windows
+      #-(or windows dotcl)
       (multiple-value-bind (b2 status2 response-headers2 uri2 opaque-socket-stream2)
           (dex:get (localhost) :keep-alive t :use-connection-pool nil :stream opaque-socket-stream)
         (declare (ignorable b2 response-headers2 uri2))
@@ -587,9 +587,9 @@
   ;; in the second case also requests connection interruption.
   ;; Previously, this second case lead to an error when closed connection
   ;; was returned to the pool.
-  #+windows
+  #+(or windows dotcl)
   (skip "Skipped because connection pool is not used on Windows.")
-  #-windows
+  #-(or windows dotcl)
   (let ((success-count 0)
         (error-count 0)
         (error-and-close-count 0))
