@@ -52,9 +52,9 @@
         (ok (equal body "/foo"))))))
 
 (deftest proxy-http-tests
-  #+(or windows dotcl)
+  #+windows
   (skip "Skipped proxy tests on Windows")
-  #-(or windows dotcl)
+  #-windows
   (testing-app ("proxy (http) case")
       ; proxy behavior is same as direct connection if http
       (lambda (env)
@@ -89,8 +89,10 @@
         (ok (equal body (format nil "lisp.org~%/foo")))))))
 
 (deftest proxy-socks5-tests
-  #+(or windows dotcl)
+  #+windows
   (skip "SOCKS5 proxy tests are skipped")
+  #+(and (not windows) dotcl)
+  (skip "SOCKS5 handshake tests call the usocket backend, which dotcl does not use")
   #-(or windows dotcl)
   (testing-app ("proxy (socks5) case")
       (flet ((check (uri in out)
@@ -205,9 +207,9 @@
         (ok (equal (quri:uri-path uri) "/200"))))))
 
 (deftest cross-host-redirect-credential-stripping-tests
-  #+(or windows dotcl)
+  #+windows
   (skip "Cross-host redirect credential tests use usocket backend only")
-  #-(or windows dotcl)
+  #-windows
   ;; Outer server: target that echoes back the Authorization header (or empty string)
   (testing-app ("cross-host redirect target")
       (lambda (env)
@@ -242,9 +244,9 @@
               (ok (equal body "") "Authorization header must not reach the target"))))))))
 
 (deftest same-host-redirect-credential-preservation-tests
-  #+(or windows dotcl)
+  #+windows
   (skip "Same-host redirect credential preservation tests use usocket backend only")
-  #-(or windows dotcl)
+  #-windows
   ;; Single server: /redirect-post returns 301 to /echo-auth; /echo-auth echoes Authorization header
   (testing-app ("same-host redirect credential preservation")
       (lambda (env)
@@ -263,26 +265,26 @@
           (ok (not (equal body "")) "Authorization header must be preserved on same-host redirect"))))))
 
 (deftest content-disposition-tests
-  #+(or windows dotcl)
+  #+windows
   (skip "Content-Disposition tests are skipped")
-  #-(or windows dotcl)
+  #-windows
   (testing "content-disposition"
-    (ok (equal (dexador.backend.usocket::content-disposition "upload" #P"data/plain-file.txt")
+    (ok (equal (dexador.body::content-disposition "upload" #P"data/plain-file.txt")
                (format nil "Content-Disposition: form-data; name=\"upload\"; filename=\"plain-file.txt\"~C~C"
                        #\Return #\Newline))
         "ASCII file name")
-    (ok (equal (dexador.backend.usocket::content-disposition "upload" #P"data/plain file.txt")
+    (ok (equal (dexador.body::content-disposition "upload" #P"data/plain file.txt")
                (format nil "Content-Disposition: form-data; name=\"upload\"; filename=\"plain file.txt\"~C~C"
                        #\Return #\Newline))
         "ASCII file name with space")
     #+ecl
     (skip "Skipped because UTF-8 pathname is not allowed on ECL")
     #-ecl
-    (ok (equal (dexador.backend.usocket::content-disposition "upload" #P"data/foo-あいうえお.txt")
+    (ok (equal (dexador.body::content-disposition "upload" #P"data/foo-あいうえお.txt")
                (format nil "Content-Disposition: form-data; name=\"upload\"; filename*=UTF-8''foo-%E3%81%82%E3%81%84%E3%81%86%E3%81%88%E3%81%8A.txt~C~C"
                        #\Return #\Newline))
         "UTF-8 file name")
-    (ok (equal (dexador.backend.usocket::content-disposition "title" "ignore")
+    (ok (equal (dexador.body::content-disposition "title" "ignore")
                (format nil "Content-Disposition: form-data; name=\"title\"~C~C"
                        #\Return #\Newline))
         "string value")))
@@ -443,9 +445,9 @@
         '(200 (:content-type "text/plain") ("hi")))
     ;; decoding stream
     (let ((body (dex:get (localhost) :want-stream t :keep-alive nil)))
-      #+(or windows dotcl)
+      #+windows
       (ok (typep body 'stream))
-      #-(or windows dotcl)
+      #-windows
       (ok (typep body 'dexador.decoding-stream:decoding-stream)
           "body is a decoding stream")
       (ok (subtypep (stream-element-type body) 'babel:unicode-char)
@@ -472,9 +474,9 @@
               ("[{\"name\":\"allow-statement-in-has-a\",\"commit\":{\"sha\":\"d58b3c96503786c64eb2dba22980ebb14010bdbf\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/d58b3c96503786c64eb2dba22980ebb14010bdbf\"}},{\"name\":\"fix-has-a\",\"commit\":{\"sha\":\"4bcea61e84402317ab49605918972983a1511e6a\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/4bcea61e84402317ab49605918972983a1511e6a\"}},{\"name\":\"jojo\",\"commit\":{\"sha\":\"d2b753e7fdd0dbeada9721380cf410186a85535b\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/d2b753e7fdd0dbeada9721380cf410186a85535b\"}},{\"name\":\"master\",\"commit\":{\"sha\":\"d2b753e7fdd0dbeada9721380cf410186a85535b\",\"url\":\"https://api.github.com/repos/fukamachi/datafly/commits/d2b753e7fdd0dbeada9721380cf410186a85535b\"}}]")))
     ;; decoding stream
     (let ((body (dex:get (localhost) :want-stream t)))
-      #+(or windows dotcl)
+      #+windows
       (ok (typep body 'stream))
-      #-(or windows dotcl)
+      #-windows
       (ok (typep body 'dexador.decoding-stream:decoding-stream)
           "body is a decoding stream")
       (ok (subtypep (stream-element-type body) 'babel:unicode-char)
@@ -551,6 +553,8 @@
       #-(or windows dotcl)
       (ok (open-stream-p opaque-socket-stream) "stream is kept alive")
       (ok (= status 200) "success")
+      #+dotcl
+      (skip "Passing a kept-alive socket stream back in is specific to the usocket backend")
       #-(or windows dotcl)
       (multiple-value-bind (b2 status2 response-headers2 uri2 opaque-socket-stream2)
           (dex:get (localhost) :keep-alive t :use-connection-pool nil :stream opaque-socket-stream)
@@ -587,8 +591,10 @@
   ;; in the second case also requests connection interruption.
   ;; Previously, this second case lead to an error when closed connection
   ;; was returned to the pool.
-  #+(or windows dotcl)
+  #+windows
   (skip "Skipped because connection pool is not used on Windows.")
+  #+(and dotcl (not windows))
+  (skip "Skipped because the dotcl backend pools connections in HttpClient, not in dexador.connection-cache.")
   #-(or windows dotcl)
   (let ((success-count 0)
         (error-count 0)

@@ -7,15 +7,16 @@
 ;;;; *dexador-backend*), so dexador works the same on Windows/Linux/macOS without
 ;;;; a native winhttp / usocket+ssl transport.
 ;;;;
-;;;; HttpClient handles TLS, redirects and transfer/content decompression itself,
-;;;; so this file only converts request/response between dexador's contract and
-;;;; the CLR objects.  `request' returns the same values the other backends do:
+;;;; HttpClient handles TLS and transfer/content decompression itself and REQUEST
+;;;; follows redirects, so this file only converts request/response between
+;;;; dexador's contract and the CLR objects.  `request' returns the same values the other backends do:
 ;;;;   (values body status response-headers uri).
 
 (defpackage #:dexador.backend.dotcl
   (:nicknames :dex.dotcl)
   (:use #:cl
-        #:dexador.util)
+        #:dexador.util
+        #:dexador.restarts)
   (:import-from #:dexador.body
                 #:decode-body
                 #:write-multipart-content)
@@ -88,6 +89,12 @@ both the message headers and the content headers of RESPONSE."
       (unless (dotnet-null-p content)
         (%merge-header-lines
          (dotnet:invoke (dotnet:invoke content "get_Headers") "ToString") hash)))
+    ;; Set-Cookie lines must stay separate: a cookie's Expires contains a comma.
+    (let ((headers (dotnet:invoke response "get_Headers")))
+      (when (dotnet:invoke headers "Contains" "Set-Cookie")
+        (setf (gethash "set-cookie" hash)
+              (%split-lines (dotnet:static "System.String" "Join" (string #\Newline)
+                                           (dotnet:invoke headers "GetValues" "Set-Cookie"))))))
     hash))
 
 (defun dotnet-null-p (obj)
@@ -156,9 +163,9 @@ only another kind of vector is copied. No per-byte argument list is built."
 ;;; cut did) throws that away.
 ;;;
 ;;; Cached clients are keyed only by the handler-config dimensions that must
-;;; differ between them -- certificate policy and redirect policy.  Cookies are
-;;; always off and decompression is always "All", so they are not part of the
-;;; key.  Per-request timeouts are NOT a handler dimension: HttpClient.Timeout is
+;;; differ between them -- certificate policy and proxy.  Cookies are always off,
+;;; automatic redirects are always off and decompression is always "All", so they
+;;; are not part of the key.  Per-request timeouts are NOT a handler dimension: HttpClient.Timeout is
 ;;; per-client, so we leave the shared client's timeout Infinite and enforce the
 ;;; per-call timeout with a CancellationTokenSource instead -- that lets a single
 ;;; client serve calls with different timeouts.
@@ -170,15 +177,35 @@ only another kind of vector is copied. No per-byte argument list is built."
 (defvar *client-cache* (make-hash-table :test 'equal)
   "config-key -> shared HttpClient. See CLIENT-CACHE-KEY.")
 
-(defun make-http-client (insecure max-redirects)
+(defun make-web-proxy (proxy-uri)
+  (let* ((uri (quri:uri proxy-uri))
+         (userinfo (quri:uri-userinfo uri))
+         (web-proxy (dotnet:new "System.Net.WebProxy"
+                                (format nil "~A://~A:~A"
+                                        (quri:uri-scheme uri)
+                                        (quri:uri-host uri)
+                                        (quri:uri-port uri)))))
+    (when userinfo
+      (let ((colon (position #\: userinfo)))
+        (dotnet:invoke web-proxy "set_Credentials"
+                       (dotnet:new "System.Net.NetworkCredential"
+                                   (subseq userinfo 0 colon)
+                                   (if colon (subseq userinfo (1+ colon)) "")))))
+    web-proxy))
+
+(defun make-http-client (insecure proxy)
+  "PROXY is NIL (the .NET default), :NONE (no handler proxy) or a proxy URI string."
   (let ((handler (dotnet:new "System.Net.Http.HttpClientHandler")))
     (dotnet:invoke handler "set_UseCookies" nil)
     (dotnet:invoke handler "set_AutomaticDecompression" "All")
-    (if (and max-redirects (plusp max-redirects))
-        (progn
-          (dotnet:invoke handler "set_AllowAutoRedirect" t)
-          (dotnet:invoke handler "set_MaxAutomaticRedirections" max-redirects))
-        (dotnet:invoke handler "set_AllowAutoRedirect" nil))
+    ;; REQUEST follows redirects itself.
+    (dotnet:invoke handler "set_AllowAutoRedirect" nil)
+    (cond ((null proxy))
+          ((eq proxy :none)
+           (dotnet:invoke handler "set_UseProxy" nil))
+          (t
+           (dotnet:invoke handler "set_UseProxy" t)
+           (dotnet:invoke handler "set_Proxy" (make-web-proxy proxy))))
     (when insecure
       ;; Accept any server certificate (used when :insecure / *not-verify-ssl*).
       (dotnet:invoke handler "set_ServerCertificateCustomValidationCallback"
@@ -193,17 +220,16 @@ only another kind of vector is copied. No per-byte argument list is built."
                      (dotnet:static "System.TimeSpan" "FromMilliseconds" -1.0d0))
       client)))
 
-(defun client-cache-key (insecure max-redirects)
-  (list (and insecure t)
-        (if (and max-redirects (plusp max-redirects)) max-redirects 0)))
+(defun client-cache-key (insecure proxy)
+  (list (and insecure t) proxy))
 
-(defun shared-client (insecure max-redirects)
+(defun shared-client (insecure proxy)
   "The cached HttpClient for this config, creating it on first use.  Returns the
 same object (EQ) for equal configs, so repeated same-config calls reuse it."
-  (let ((key (client-cache-key insecure max-redirects)))
+  (let ((key (client-cache-key insecure proxy)))
     (or (gethash key *client-cache*)
         (setf (gethash key *client-cache*)
-              (make-http-client insecure max-redirects)))))
+              (make-http-client insecure proxy)))))
 
 (defun clear-client-cache ()
   "Dispose and drop every cached shared HttpClient.  Bound to dexador's
@@ -213,6 +239,68 @@ CLEAR-CONNECTION-POOL below."
              (ignore-errors (dotnet:invoke client "Dispose")))
            *client-cache*)
   (clrhash *client-cache*))
+
+;;; ------------------------------------------------------------------
+;;; Proxy, redirect and body helpers
+
+(defun usable-proxy-uri (proxy)
+  (let ((uri (and proxy (quri:uri proxy))))
+    (and uri
+         (member (quri:uri-scheme uri) '("http" "https" "socks5") :test #'equal)
+         uri)))
+
+(defun proxy-via-origin-form-p (proxy-uri uri)
+  "True for a plain http URI behind an http(s) proxy.  As in the usocket backend,
+such a request goes to the proxy in origin form with the target's Host header."
+  (and (string= (quri:uri-scheme uri) "http")
+       (not (string= (quri:uri-scheme proxy-uri) "socks5"))))
+
+(defun origin-form-uri (proxy-uri uri)
+  (quri:make-uri :scheme (quri:uri-scheme proxy-uri)
+                 :host (quri:uri-host proxy-uri)
+                 :port (quri:uri-port proxy-uri)
+                 :path (or (quri:uri-path uri) "/")
+                 :query (quri:uri-query uri)))
+
+(defun host-header-value (uri)
+  (let ((port (quri:uri-port uri)))
+    (if (and port (/= port (if (string= (quri:uri-scheme uri) "https") 443 80)))
+        (format nil "~A:~A" (quri:uri-host uri) port)
+        (quri:uri-host uri))))
+
+(defun strip-userinfo (uri)
+  (let ((copy (quri:uri (quri:render-uri uri))))
+    (setf (quri:uri-userinfo copy) nil)
+    copy))
+
+(defun same-server-p (location uri)
+  (or (null (quri:uri-host location))
+      (and (string= (quri:uri-scheme location) (quri:uri-scheme uri))
+           (string-equal (quri:uri-host location) (quri:uri-host uri))
+           (eql (quri:uri-port location) (quri:uri-port uri)))))
+
+(defun remove-headers (names headers)
+  (remove-if (lambda (h) (member (car h) names :test #'string-equal)) headers))
+
+;; A handler-bind handler for a .NET exception runs after the stack has unwound,
+;; so restarts established around the call are gone.  Catching and signalling it
+;; again here keeps them available.
+(defmacro resignal-errors (&body body)
+  `(handler-case (progn ,@body)
+     (error (e) (error e))))
+
+(defun convert-body (netbytes content-type force-binary force-string want-stream)
+  (let ((default-charset (if force-string babel:*default-character-encoding* nil)))
+    (if want-stream
+        (let ((stream (dotnet:to-stream (dotnet:new "System.IO.MemoryStream" netbytes)
+                                        :binary t)))
+          (if force-binary
+              stream
+              (decode-body content-type stream :default-charset default-charset)))
+        (let ((octets (netbytes->octets netbytes)))
+          (if force-binary
+              octets
+              (decode-body content-type octets :default-charset default-charset))))))
 
 ;;; ------------------------------------------------------------------
 ;;; request
@@ -230,13 +318,15 @@ CLEAR-CONNECTION-POOL below."
                          stream (verbose *verbose*)
                          force-binary force-string
                          want-stream
-                         proxy
+                         (proxy *default-proxy*)
                          (insecure *not-verify-ssl*)
                          ca-path)
   (declare (ignore version
                    ssl-key-file ssl-cert-file ssl-key-password
-                   stream verbose proxy ca-path args))
+                   stream verbose ca-path args))
   (let* ((uri (quri:uri uri))
+         (userinfo (quri:uri-userinfo uri))
+         (proxy-uri (usable-proxy-uri proxy))
          (content-type-cell (find :content-type headers
                                   :key #'car :test #'string-equal))
          (preferred-content-type (cdr content-type-cell))
@@ -251,8 +341,14 @@ CLEAR-CONNECTION-POOL below."
                                  (or (null preferred-content-type)
                                      (string-equal preferred-content-type
                                                    "application/x-www-form-urlencoded"))))
-         (user-agent (cdr (find :user-agent headers
-                                :key #'car :test #'string-equal))))
+         ;; Connection reuse: the shared cached client (and .NET's connection pool
+         ;; under it) is used whenever :use-connection-pool and :keep-alive are both
+         ;; true (the defaults).  Otherwise a throwaway client is made, told to close
+         ;; the connection, and disposed when REQUEST returns.
+         (fresh (or (not use-connection-pool) (not keep-alive)))
+         (fresh-clients '())
+         (redirects-left (or max-redirects 0))
+         (timeout-ms (* 1000 (+ (or connect-timeout 0) (or read-timeout 0)))))
     (multiple-value-bind (body-octets detected-content-type)
         (convert-content content multipart-p form-urlencoded-p preferred-content-type)
       (when detected-content-type
@@ -261,55 +357,51 @@ CLEAR-CONNECTION-POOL below."
               (multipart-p
                (setf headers (substitute (cons (car content-type-cell) detected-content-type)
                                          content-type-cell headers)))))
+      (labels
+          ((client-for (target)
+             ;; Plain http through an http proxy is sent to the proxy directly,
+             ;; so the handler must not proxy it a second time.
+             (let ((handler-proxy (cond ((null proxy-uri) nil)
+                                        ((proxy-via-origin-form-p proxy-uri target) :none)
+                                        (t (quri:render-uri proxy-uri)))))
+               (if fresh
+                   (let ((client (make-http-client insecure handler-proxy)))
+                     (push client fresh-clients)
+                     client)
+                   (shared-client insecure handler-proxy))))
 
-      ;; Cookie jar -> Cookie header
-      (when cookie-jar
-        (let ((cookies (cookie-jar-host-cookies
-                        cookie-jar (quri:uri-host uri) (or (quri:uri-path uri) "/")
-                        :securep (string= (quri:uri-scheme uri) "https"))))
-          (when cookies
-            (setf headers (append headers
-                                  `(("Cookie" . ,(write-cookie-header cookies))))))))
-
-      ;; Connection reuse: the shared cached client (and .NET's connection pool
-      ;; under it) is used whenever :use-connection-pool and :keep-alive are both
-      ;; true (the defaults).  Otherwise a throwaway client is made, told to close
-      ;; the connection, and disposed after the body is read.
-      (let* ((fresh (or (not use-connection-pool) (not keep-alive)))
-             (client (if fresh
-                         (make-http-client insecure max-redirects)
-                         (shared-client insecure max-redirects)))
-             (cts (dotnet:new "System.Threading.CancellationTokenSource"))
-             (timeout-ms (* 1000 (+ (or connect-timeout 0) (or read-timeout 0)))))
-        (when (plusp timeout-ms)
-          ;; Per-request timeout, independent of the client-wide (Infinite) one.
-          (dotnet:invoke cts "CancelAfter" timeout-ms))
-        (unwind-protect
-             (let* ((method-obj (dotnet:new "System.Net.Http.HttpMethod"
-                                            (string-upcase (string method))))
+           (build-request (target request-headers)
+             (let* ((via-origin-form (and proxy-uri (proxy-via-origin-form-p proxy-uri target)))
                     (req (dotnet:new "System.Net.Http.HttpRequestMessage"
-                                     method-obj (quri:render-uri uri)))
+                                     (dotnet:new "System.Net.Http.HttpMethod"
+                                                 (string-upcase (string method)))
+                                     (quri:render-uri (if via-origin-form
+                                                          (origin-form-uri proxy-uri target)
+                                                          target))))
                     (req-headers (dotnet:invoke req "get_Headers"))
-                    (content-obj nil)
-                    (content-headers nil))
-               ;; Body
+                    (content-headers nil)
+                    (user-agent (cdr (find :user-agent request-headers
+                                           :key #'car :test #'string-equal))))
                (when body-octets
-                 (setf content-obj (dotnet:new "System.Net.Http.ByteArrayContent"
-                                               (octets->netbytes body-octets)))
-                 (setf content-headers (dotnet:invoke content-obj "get_Headers"))
-                 (dotnet:invoke req "set_Content" content-obj))
+                 (let ((content-obj (dotnet:new "System.Net.Http.ByteArrayContent"
+                                                (octets->netbytes body-octets))))
+                   (setf content-headers (dotnet:invoke content-obj "get_Headers"))
+                   (dotnet:invoke req "set_Content" content-obj)))
                (when fresh
                  (add-header req-headers content-headers "Connection" "close"))
-               ;; User-Agent
+               (when via-origin-form
+                 (dotnet:invoke req-headers "set_Host" (host-header-value target))
+                 (when-let (proxy-userinfo (quri:uri-userinfo proxy-uri))
+                   (add-header req-headers content-headers "Proxy-Authorization"
+                               (concatenate 'string "Basic "
+                                            (cl-base64:string-to-base64-string proxy-userinfo)))))
                (add-header req-headers content-headers
                            "User-Agent" (or user-agent *default-user-agent*))
-               ;; Authorization
                (cond
-                 ((quri:uri-userinfo uri)
+                 (userinfo
                   (add-header req-headers content-headers "Authorization"
                               (concatenate 'string "Basic "
-                                           (cl-base64:string-to-base64-string
-                                            (quri:uri-userinfo uri)))))
+                                           (cl-base64:string-to-base64-string userinfo))))
                  ((and basic-auth bearer-auth)
                   (error "You should only use one Authorization header."))
                  (bearer-auth
@@ -321,64 +413,103 @@ CLEAR-CONNECTION-POOL below."
                                            (cl-base64:string-to-base64-string
                                             (format nil "~A:~A"
                                                     (car basic-auth) (cdr basic-auth)))))))
-               ;; Remaining user headers (Content-Type included; skip User-Agent,
-               ;; already added).
-               (dolist (h headers)
+               (dolist (h request-headers)
                  (unless (string-equal (car h) :user-agent)
                    (add-header req-headers content-headers (car h) (cdr h))))
+               req))
 
-               ;; Send (per-request timeout via the cancellation token)
-               (let* ((response (dotnet:await
-                                 (dotnet:invoke client "SendAsync" req
-                                                (dotnet:invoke cts "get_Token"))))
-                      (status (dotnet:static "System.Convert" "ToInt32"
-                                             (dotnet:invoke response "get_StatusCode")))
-                      (response-headers (response-headers-hash response))
-                      (final-uri (let ((rm (dotnet:invoke response "get_RequestMessage")))
-                                   (if (dotnet-null-p rm)
-                                       uri
-                                       (quri:uri (dotnet:invoke
-                                                  (dotnet:invoke rm "get_RequestUri")
-                                                  "get_AbsoluteUri"))))))
-                 ;; Cookie jar update
-                 (when cookie-jar
-                   (when-let (set-cookies (ensure-list (gethash "set-cookie" response-headers)))
-                     (merge-cookies cookie-jar
-                                    (remove nil (mapcar
-                                                 (lambda (cookie)
-                                                   (unless (zerop (length cookie))
-                                                     (parse-set-cookie-header
-                                                      cookie (quri:uri-host uri)
-                                                      (quri:uri-path uri))))
-                                                 set-cookies)))))
-                 ;; Body bytes
-                 (let* ((content-obj (dotnet:invoke response "get_Content"))
-                        (netbytes (dotnet:await (dotnet:invoke content-obj "ReadAsByteArrayAsync")))
-                        (octets (netbytes->octets netbytes))
-                        (body (if force-binary
-                                  octets
-                                  (decode-body (gethash "content-type" response-headers) octets
-                                               :default-charset (if force-string
-                                                                    babel:*default-character-encoding*
-                                                                    nil)))))
-                   (when (<= 400 status)
-                     (http-request-failed status
-                                          :body body
-                                          :headers response-headers
-                                          :uri final-uri
-                                          :method method))
-                   (when want-stream
-                     (setf body
-                           (etypecase body
-                             (string (make-string-input-stream body))
-                             (vector (dotnet:to-stream
-                                      (dotnet:new "System.IO.MemoryStream" netbytes)
-                                      :binary t)))))
-                   (values body status response-headers final-uri))))
-          ;; Cleanup: never dispose the shared client (that kills the pool);
-          ;; dispose only the throwaway one and always the token source.
-          (ignore-errors (dotnet:invoke cts "Dispose"))
-          (when fresh (ignore-errors (dotnet:invoke client "Dispose"))))))))
+           (cookie-headers-for (target)
+             (when cookie-jar
+               (let ((cookies (cookie-jar-host-cookies
+                               cookie-jar (quri:uri-host target) (or (quri:uri-path target) "/")
+                               :securep (string= (quri:uri-scheme target) "https"))))
+                 (when cookies
+                   `(("Cookie" . ,(write-cookie-header cookies)))))))
+
+           (store-cookies (response-headers target)
+             (when cookie-jar
+               (when-let (set-cookies (append (ensure-list (gethash "set-cookie" response-headers))
+                                              (ensure-list (gethash "set-cookie2" response-headers))))
+                 (merge-cookies cookie-jar
+                                (remove nil (mapcar
+                                             (lambda (cookie)
+                                               (unless (zerop (length cookie))
+                                                 (parse-set-cookie-header
+                                                  cookie (quri:uri-host target)
+                                                  (quri:uri-path target))))
+                                             set-cookies))))))
+
+           (follow-redirect (location target status)
+             (let ((same-server (same-server-p location target)))
+               (setf (quri:uri-userinfo location) nil)
+               (setf uri (quri:merge-uris location target))
+               (decf redirects-left)
+               (unless same-server
+                 (setf userinfo nil
+                       basic-auth nil
+                       bearer-auth nil
+                       headers (remove-headers '(:authorization :proxy-authorization :cookie)
+                                               headers)))
+               (unless (or (= status 307) (= status 308)
+                           (member method '(:get :head)))
+                 (setf method :get
+                       body-octets nil
+                       headers (remove-headers '(:content-type :content-length) headers)))))
+
+           (attempt ()
+             ;; One exchange with the current URI.  Returns after setting up the
+             ;; next URI when the response is a redirect, and otherwise returns
+             ;; from REQUEST.
+             (let* ((target (strip-userinfo uri))
+                    (client (client-for target))
+                    (cts (dotnet:new "System.Threading.CancellationTokenSource")))
+               (when (plusp timeout-ms)
+                 ;; Per-request timeout, independent of the client-wide (Infinite) one.
+                 (dotnet:invoke cts "CancelAfter" timeout-ms))
+               (unwind-protect
+                    (let* ((response (resignal-errors
+                                       (dotnet:await
+                                        (dotnet:invoke client "SendAsync"
+                                                       (build-request target
+                                                                      (append headers
+                                                                              (cookie-headers-for target)))
+                                                       (dotnet:invoke cts "get_Token")))))
+                           (status (dotnet:static "System.Convert" "ToInt32"
+                                                  (dotnet:invoke response "get_StatusCode")))
+                           (response-headers (response-headers-hash response))
+                           (location (gethash "location" response-headers)))
+                      (store-cookies response-headers target)
+                      (when (and (member status '(301 302 303 307 308))
+                                 location
+                                 (/= redirects-left 0))
+                        (ignore-errors (dotnet:invoke response "Dispose"))
+                        (follow-redirect (quri:uri location) target status)
+                        (return-from attempt))
+                      (let* ((content-obj (dotnet:invoke response "get_Content"))
+                             (netbytes (resignal-errors
+                                         (dotnet:await
+                                          (dotnet:invoke content-obj "ReadAsByteArrayAsync"))))
+                             (body (convert-body netbytes (gethash "content-type" response-headers)
+                                                 force-binary force-string want-stream)))
+                        (when (<= 400 status)
+                          (restart-case
+                              (http-request-failed status
+                                                   :body body
+                                                   :headers response-headers
+                                                   :uri target
+                                                   :method method)
+                            (ignore-and-continue ())))
+                        (return-from request
+                          (values body status response-headers target))))
+                 (ignore-errors (dotnet:invoke cts "Dispose"))))))
+        (unwind-protect
+             (loop
+               (restart-case (attempt)
+                 (retry-request ()
+                   :report "Retry the same request.")))
+          ;; Never dispose the shared client (that kills the pool).
+          (dolist (client fresh-clients)
+            (ignore-errors (dotnet:invoke client "Dispose"))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Give dexador's public CLEAR-CONNECTION-POOL a dotcl meaning: dispose our
